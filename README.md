@@ -26,9 +26,15 @@ npm install -g traefik-hub-mcp
 | `TRAEFIK_HUB_DIR` | Yes | -- | Path to the Traefik Hub repo root (contains `docker-compose.yml`) |
 | `TRAEFIK_API_URL` | No | `http://localhost:8080` | Traefik API base URL |
 
-## Claude Code Setup
+## Configuration
 
-Add to your Claude Code MCP configuration (`~/.claude.json` or project `.mcp.json`):
+### Claude Code
+
+```bash
+claude mcp add traefik -e TRAEFIK_HUB_DIR=/path/to/traefik-hub -e TRAEFIK_CONFIG_DIR=/path/to/traefik-hub/traefik -e TRAEFIK_API_URL=http://localhost:8080 -- npx -y traefik-hub-mcp
+```
+
+Or add manually to `~/.claude.json` or project `.mcp.json`:
 
 ```json
 {
@@ -41,6 +47,90 @@ Add to your Claude Code MCP configuration (`~/.claude.json` or project `.mcp.jso
         "TRAEFIK_CONFIG_DIR": "/path/to/traefik-hub/traefik",
         "TRAEFIK_API_URL": "http://localhost:8080"
       }
+    }
+  }
+}
+```
+
+### Cursor
+
+Add to Cursor Settings > MCP Servers:
+
+```json
+{
+  "mcpServers": {
+    "traefik": {
+      "command": "npx",
+      "args": ["-y", "traefik-hub-mcp"],
+      "env": {
+        "TRAEFIK_HUB_DIR": "/path/to/traefik-hub",
+        "TRAEFIK_CONFIG_DIR": "/path/to/traefik-hub/traefik",
+        "TRAEFIK_API_URL": "http://localhost:8080"
+      }
+    }
+  }
+}
+```
+
+### VS Code (Copilot)
+
+Add to your VS Code `settings.json`:
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "traefik": {
+        "type": "stdio",
+        "command": "npx",
+        "args": ["-y", "traefik-hub-mcp"],
+        "env": {
+          "TRAEFIK_HUB_DIR": "/path/to/traefik-hub",
+          "TRAEFIK_CONFIG_DIR": "/path/to/traefik-hub/traefik",
+          "TRAEFIK_API_URL": "http://localhost:8080"
+        }
+      }
+    }
+  }
+}
+```
+
+### Windsurf
+
+Add to `~/.codeium/windsurf/mcp_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "traefik": {
+      "command": "npx",
+      "args": ["-y", "traefik-hub-mcp"],
+      "env": {
+        "TRAEFIK_HUB_DIR": "/path/to/traefik-hub",
+        "TRAEFIK_CONFIG_DIR": "/path/to/traefik-hub/traefik",
+        "TRAEFIK_API_URL": "http://localhost:8080"
+      }
+    }
+  }
+}
+```
+
+### Cline
+
+Add to Cline MCP settings:
+
+```json
+{
+  "mcpServers": {
+    "traefik": {
+      "command": "npx",
+      "args": ["-y", "traefik-hub-mcp"],
+      "env": {
+        "TRAEFIK_HUB_DIR": "/path/to/traefik-hub",
+        "TRAEFIK_CONFIG_DIR": "/path/to/traefik-hub/traefik",
+        "TRAEFIK_API_URL": "http://localhost:8080"
+      },
+      "disabled": false
     }
   }
 }
