@@ -39,7 +39,25 @@ networks:
   traefik-public:
     external: true
 
-# Access at: http://${domain}`
+# Access at: http://${domain}
+
+---
+
+## When to Route Through Traefik
+
+**HTTP services (web apps, APIs)** - Route through Traefik:
+- Web applications, REST APIs, GraphQL endpoints
+- Any service that communicates over HTTP/HTTPS
+
+**TCP services (databases, caches)** - Keep internal, no Traefik routing:
+- PostgreSQL, MySQL, MongoDB, Redis, etc.
+- Keep them on the internal Docker network only (no \`ports:\` mapping)
+
+**Accessing internal services:**
+\`\`\`bash
+docker compose exec <db-service> psql -U postgres
+docker compose exec <service-name> sh
+\`\`\``
 }
 
 /**
@@ -307,6 +325,66 @@ export function addMiddlewareToConfig(
 /**
  * Update CORS origins in a config object
  */
+/**
+ * Database image patterns for detection
+ */
+export const DATABASE_IMAGE_PATTERNS = [
+  'postgres', 'postgresql', 'mysql', 'mariadb',
+  'mongo', 'mongodb', 'redis', 'memcached',
+  'cassandra', 'couchdb', 'influxdb', 'elasticsearch',
+  'mssql', 'sqlserver',
+]
+
+/**
+ * Check if an image name is a database
+ */
+export function isDatabaseImage(image: string): boolean {
+  const lowerImage = image.toLowerCase()
+  return DATABASE_IMAGE_PATTERNS.some(pattern => lowerImage.includes(pattern))
+}
+
+/**
+ * Check if an IP is localhost-only
+ */
+export function isLocalhostOnly(ip: string): boolean {
+  return ip === '127.0.0.1' || ip === '::1' || ip === 'localhost' || ip === ''
+}
+
+/**
+ * Container port information for database check
+ */
+export interface ContainerPortInfo {
+  name: string
+  image: string
+  ports: Array<{ IP: string; PrivatePort: number; PublicPort?: number }>
+}
+
+/**
+ * Check for database containers with exposed ports
+ */
+export function checkDatabasePorts(containers: ContainerPortInfo[]): {
+  exposedDatabases: string[]
+  allSafe: boolean
+} {
+  const exposedDatabases: string[] = []
+
+  for (const container of containers) {
+    if (!isDatabaseImage(container.image)) continue
+
+    const exposedPorts = container.ports.filter(p => {
+      if (!p.PublicPort) return false
+      return !isLocalhostOnly(p.IP)
+    })
+
+    if (exposedPorts.length > 0) {
+      const portList = exposedPorts.map(p => `${p.PublicPort}:${p.PrivatePort}`).join(', ')
+      exposedDatabases.push(`${container.name} (${container.image}) - ports: ${portList}`)
+    }
+  }
+
+  return { exposedDatabases, allSafe: exposedDatabases.length === 0 }
+}
+
 export function updateCorsOrigins(
   currentOrigins: string[],
   add?: string[],

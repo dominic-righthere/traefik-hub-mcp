@@ -17,6 +17,8 @@ import {
   formatSetupCheckResults,
   addMiddlewareToConfig,
   updateCorsOrigins,
+  checkDatabasePorts,
+  type ContainerPortInfo,
 } from "./handlers.js";
 
 const execAsync = promisify(exec);
@@ -474,7 +476,7 @@ async function handleCheckHealth(domain: string) {
 async function handleDoctor() {
   interface Check {
     name: string;
-    status: "ok" | "fail";
+    status: "ok" | "warn" | "fail";
     detail?: string;
     tip?: string;
   }
@@ -595,22 +597,61 @@ async function handleDoctor() {
     checks.push({ name: "Active routes", status: "fail", tip: "Could not fetch from Traefik API" });
   }
 
+  // 9. Check for database containers with exposed ports
+  try {
+    const allContainers = await docker.listContainers({ all: false });
+    const containerInfo: ContainerPortInfo[] = allContainers.map(c => ({
+      name: c.Names[0]?.replace(/^\//, '') || 'unknown',
+      image: c.Image,
+      ports: c.Ports || []
+    }));
+
+    const dbCheck = checkDatabasePorts(containerInfo);
+
+    if (!dbCheck.allSafe) {
+      checks.push({
+        name: "Database ports",
+        status: "warn",
+        detail: `${dbCheck.exposedDatabases.length} database(s) with exposed ports`,
+        tip: `Consider removing host port mappings. Use \`docker compose exec\` instead.`
+      });
+    } else {
+      checks.push({
+        name: "Database ports",
+        status: "ok",
+        detail: "No databases with exposed host ports"
+      });
+    }
+  } catch {
+    // Non-fatal - skip if container listing fails
+  }
+
   // Format output
   const lines = ["# Traefik Stack Health Check\n"];
   let allOk = true;
+  let hasWarnings = false;
   for (const check of checks) {
-    const icon = check.status === "ok" ? "✓" : "✗";
+    const icon = check.status === "ok" ? "✓" : check.status === "warn" ? "⚠" : "✗";
     let line = `${icon} **${check.name}**`;
     if (check.detail) line += ` - ${check.detail}`;
     if (check.status === "fail") {
       allOk = false;
+      if (check.tip) line += `\n  └─ Tip: ${check.tip}`;
+    } else if (check.status === "warn") {
+      hasWarnings = true;
       if (check.tip) line += `\n  └─ Tip: ${check.tip}`;
     }
     lines.push(line);
   }
 
   lines.push("");
-  lines.push(allOk ? "**All checks passed!**" : "**Some checks failed.** See tips above.");
+  if (!allOk) {
+    lines.push("**Some checks failed.** See tips above.");
+  } else if (hasWarnings) {
+    lines.push("**All checks passed with warnings.** See tips above.");
+  } else {
+    lines.push("**All checks passed!**");
+  }
 
   return { content: [{ type: "text", text: lines.join("\n") }] };
 }

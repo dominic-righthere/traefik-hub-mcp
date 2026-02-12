@@ -6,6 +6,10 @@ import {
   formatSetupCheckResults,
   addMiddlewareToConfig,
   updateCorsOrigins,
+  isDatabaseImage,
+  isLocalhostOnly,
+  checkDatabasePorts,
+  DATABASE_IMAGE_PATTERNS,
 } from '../src/handlers.js'
 import { parse, stringify } from 'yaml'
 
@@ -40,6 +44,15 @@ describe('generateLabels', () => {
     const result = generateLabels('app', 'app.localhost', 3000, [])
 
     expect(result).not.toContain('middlewares=')
+  })
+
+  it('includes HTTP vs TCP guidance', () => {
+    const result = generateLabels('myapp', 'myapp.localhost', 3000)
+
+    expect(result).toContain('## When to Route Through Traefik')
+    expect(result).toContain('**HTTP services (web apps, APIs)** - Route through Traefik')
+    expect(result).toContain('**TCP services (databases, caches)** - Keep internal')
+    expect(result).toContain('docker compose exec')
   })
 })
 
@@ -314,5 +327,117 @@ describe('updateCorsOrigins', () => {
 
     expect(result.origins).toEqual(['http://localhost:3000'])
     expect(result.changes).toEqual([])
+  })
+})
+
+describe('isDatabaseImage', () => {
+  it('detects common database images', () => {
+    expect(isDatabaseImage('postgres:15')).toBe(true)
+    expect(isDatabaseImage('mysql:8')).toBe(true)
+    expect(isDatabaseImage('mongo:6')).toBe(true)
+    expect(isDatabaseImage('redis:7')).toBe(true)
+    expect(isDatabaseImage('mariadb:10')).toBe(true)
+    expect(isDatabaseImage('memcached:latest')).toBe(true)
+  })
+
+  it('handles registry prefixes', () => {
+    expect(isDatabaseImage('docker.io/library/postgres:15')).toBe(true)
+    expect(isDatabaseImage('gcr.io/project/postgresql:latest')).toBe(true)
+  })
+
+  it('is case insensitive', () => {
+    expect(isDatabaseImage('POSTGRES:15')).toBe(true)
+    expect(isDatabaseImage('MySQL:8')).toBe(true)
+  })
+
+  it('returns false for non-database images', () => {
+    expect(isDatabaseImage('nginx:latest')).toBe(false)
+    expect(isDatabaseImage('node:18')).toBe(false)
+    expect(isDatabaseImage('traefik:v2.10')).toBe(false)
+  })
+})
+
+describe('isLocalhostOnly', () => {
+  it('identifies localhost IPs', () => {
+    expect(isLocalhostOnly('127.0.0.1')).toBe(true)
+    expect(isLocalhostOnly('::1')).toBe(true)
+    expect(isLocalhostOnly('localhost')).toBe(true)
+    expect(isLocalhostOnly('')).toBe(true)
+  })
+
+  it('returns false for non-localhost IPs', () => {
+    expect(isLocalhostOnly('0.0.0.0')).toBe(false)
+    expect(isLocalhostOnly('192.168.1.1')).toBe(false)
+    expect(isLocalhostOnly('10.0.0.1')).toBe(false)
+  })
+})
+
+describe('checkDatabasePorts', () => {
+  it('returns allSafe when no databases have exposed ports', () => {
+    const containers = [
+      { name: 'web', image: 'nginx:latest', ports: [{ IP: '0.0.0.0', PrivatePort: 80, PublicPort: 80 }] },
+      { name: 'db', image: 'postgres:15', ports: [{ IP: '', PrivatePort: 5432 }] },
+    ]
+
+    const result = checkDatabasePorts(containers)
+
+    expect(result.allSafe).toBe(true)
+    expect(result.exposedDatabases).toEqual([])
+  })
+
+  it('detects databases with exposed ports', () => {
+    const containers = [
+      { name: 'mydb', image: 'postgres:15', ports: [{ IP: '0.0.0.0', PrivatePort: 5432, PublicPort: 5432 }] },
+    ]
+
+    const result = checkDatabasePorts(containers)
+
+    expect(result.allSafe).toBe(false)
+    expect(result.exposedDatabases).toHaveLength(1)
+    expect(result.exposedDatabases[0]).toContain('mydb')
+    expect(result.exposedDatabases[0]).toContain('postgres')
+    expect(result.exposedDatabases[0]).toContain('5432')
+  })
+
+  it('allows localhost-only database ports', () => {
+    const containers = [
+      { name: 'mydb', image: 'postgres:15', ports: [{ IP: '127.0.0.1', PrivatePort: 5432, PublicPort: 5432 }] },
+    ]
+
+    const result = checkDatabasePorts(containers)
+
+    expect(result.allSafe).toBe(true)
+  })
+
+  it('detects multiple exposed databases', () => {
+    const containers = [
+      { name: 'pg', image: 'postgres:15', ports: [{ IP: '0.0.0.0', PrivatePort: 5432, PublicPort: 5432 }] },
+      { name: 'redis', image: 'redis:7', ports: [{ IP: '0.0.0.0', PrivatePort: 6379, PublicPort: 6379 }] },
+    ]
+
+    const result = checkDatabasePorts(containers)
+
+    expect(result.allSafe).toBe(false)
+    expect(result.exposedDatabases).toHaveLength(2)
+  })
+
+  it('ignores non-database containers with exposed ports', () => {
+    const containers = [
+      { name: 'web', image: 'nginx:latest', ports: [{ IP: '0.0.0.0', PrivatePort: 80, PublicPort: 80 }] },
+    ]
+
+    const result = checkDatabasePorts(containers)
+
+    expect(result.allSafe).toBe(true)
+  })
+})
+
+describe('DATABASE_IMAGE_PATTERNS', () => {
+  it('includes common database types', () => {
+    expect(DATABASE_IMAGE_PATTERNS).toContain('postgres')
+    expect(DATABASE_IMAGE_PATTERNS).toContain('mysql')
+    expect(DATABASE_IMAGE_PATTERNS).toContain('mongo')
+    expect(DATABASE_IMAGE_PATTERNS).toContain('redis')
+    expect(DATABASE_IMAGE_PATTERNS).toContain('elasticsearch')
   })
 })
