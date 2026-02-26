@@ -10,6 +10,15 @@ import {
   isLocalhostOnly,
   checkDatabasePorts,
   DATABASE_IMAGE_PATTERNS,
+  parseSemver,
+  parsePinnedVersion,
+  compareVersions,
+  analyzeUpdate,
+  formatUpdateReport,
+  buildDomainRule,
+  addDomainRoute,
+  removeDomainRoute,
+  listDomainRoutes,
 } from '../src/handlers.js'
 import { parse, stringify } from 'yaml'
 
@@ -439,5 +448,351 @@ describe('DATABASE_IMAGE_PATTERNS', () => {
     expect(DATABASE_IMAGE_PATTERNS).toContain('mongo')
     expect(DATABASE_IMAGE_PATTERNS).toContain('redis')
     expect(DATABASE_IMAGE_PATTERNS).toContain('elasticsearch')
+  })
+})
+
+describe('parseSemver', () => {
+  it('parses full version string', () => {
+    expect(parseSemver('3.6.1')).toEqual({ major: 3, minor: 6, patch: 1, raw: '3.6.1' })
+  })
+
+  it('parses version with v prefix', () => {
+    expect(parseSemver('v3.6.1')).toEqual({ major: 3, minor: 6, patch: 1, raw: 'v3.6.1' })
+  })
+
+  it('defaults patch to 0 when missing', () => {
+    expect(parseSemver('v3.6')).toEqual({ major: 3, minor: 6, patch: 0, raw: 'v3.6' })
+  })
+
+  it('extracts version embedded in image string', () => {
+    expect(parseSemver('traefik:v3.6')).toEqual({ major: 3, minor: 6, patch: 0, raw: 'traefik:v3.6' })
+  })
+
+  it('returns null for non-version string', () => {
+    expect(parseSemver('latest')).toBeNull()
+    expect(parseSemver('hello')).toBeNull()
+  })
+
+  it('handles multi-digit components', () => {
+    expect(parseSemver('v12.34.56')).toEqual({ major: 12, minor: 34, patch: 56, raw: 'v12.34.56' })
+  })
+})
+
+describe('parsePinnedVersion', () => {
+  it('extracts version from standard compose content', () => {
+    const content = `services:\n  traefik:\n    image: traefik:v3.6\n    container_name: traefik\n`
+    const result = parsePinnedVersion(content)
+    expect(result).toEqual({ major: 3, minor: 6, patch: 0, raw: 'v3.6' })
+  })
+
+  it('extracts version with patch number', () => {
+    const content = `services:\n  traefik:\n    image: traefik:v3.6.2\n`
+    const result = parsePinnedVersion(content)
+    expect(result).toEqual({ major: 3, minor: 6, patch: 2, raw: 'v3.6.2' })
+  })
+
+  it('returns null when no traefik image found', () => {
+    const content = `services:\n  web:\n    image: nginx:latest\n`
+    expect(parsePinnedVersion(content)).toBeNull()
+  })
+
+  it('returns null for traefik:latest', () => {
+    const content = `services:\n  traefik:\n    image: traefik:latest\n`
+    expect(parsePinnedVersion(content)).toBeNull()
+  })
+})
+
+describe('compareVersions', () => {
+  it('detects patch bump', () => {
+    expect(compareVersions(
+      { major: 3, minor: 6, patch: 0, raw: '3.6.0' },
+      { major: 3, minor: 6, patch: 1, raw: '3.6.1' }
+    )).toBe('patch')
+  })
+
+  it('detects minor bump', () => {
+    expect(compareVersions(
+      { major: 3, minor: 6, patch: 0, raw: '3.6.0' },
+      { major: 3, minor: 7, patch: 0, raw: '3.7.0' }
+    )).toBe('minor')
+  })
+
+  it('detects major bump', () => {
+    expect(compareVersions(
+      { major: 3, minor: 6, patch: 0, raw: '3.6.0' },
+      { major: 4, minor: 0, patch: 0, raw: '4.0.0' }
+    )).toBe('major')
+  })
+
+  it('detects no change', () => {
+    expect(compareVersions(
+      { major: 3, minor: 6, patch: 1, raw: '3.6.1' },
+      { major: 3, minor: 6, patch: 1, raw: '3.6.1' }
+    )).toBe('none')
+  })
+
+  it('detects downgrade', () => {
+    expect(compareVersions(
+      { major: 3, minor: 7, patch: 0, raw: '3.7.0' },
+      { major: 3, minor: 6, patch: 0, raw: '3.6.0' }
+    )).toBe('downgrade')
+  })
+
+  it('major takes precedence over minor', () => {
+    expect(compareVersions(
+      { major: 3, minor: 9, patch: 9, raw: '3.9.9' },
+      { major: 4, minor: 0, patch: 0, raw: '4.0.0' }
+    )).toBe('major')
+  })
+})
+
+describe('analyzeUpdate', () => {
+  it('returns up-to-date when versions match', () => {
+    const result = analyzeUpdate({
+      runningVersion: '3.6.0',
+      dockerComposeContent: 'image: traefik:v3.6',
+      latestRelease: { tag: 'v3.6.0', body: 'notes' },
+    })
+    expect(result.safetyLevel).toBe('up-to-date')
+    expect(result.updateType).toBe('none')
+  })
+
+  it('returns safe for patch bump', () => {
+    const result = analyzeUpdate({
+      runningVersion: '3.6.0',
+      dockerComposeContent: 'image: traefik:v3.6',
+      latestRelease: { tag: 'v3.6.1', body: 'patch notes' },
+    })
+    expect(result.safetyLevel).toBe('safe')
+    expect(result.updateType).toBe('patch')
+  })
+
+  it('returns generally-safe for minor bump', () => {
+    const result = analyzeUpdate({
+      runningVersion: '3.6.0',
+      dockerComposeContent: 'image: traefik:v3.6',
+      latestRelease: { tag: 'v3.7.0', body: '' },
+    })
+    expect(result.safetyLevel).toBe('generally-safe')
+    expect(result.updateType).toBe('minor')
+  })
+
+  it('returns review-required for major bump', () => {
+    const result = analyzeUpdate({
+      runningVersion: '3.6.0',
+      dockerComposeContent: 'image: traefik:v3.6',
+      latestRelease: { tag: 'v4.0.0', body: 'breaking changes' },
+    })
+    expect(result.safetyLevel).toBe('review-required')
+    expect(result.updateType).toBe('major')
+  })
+
+  it('falls back to pinned version when running is unavailable', () => {
+    const result = analyzeUpdate({
+      runningVersion: null,
+      dockerComposeContent: 'image: traefik:v3.6.0',
+      latestRelease: { tag: 'v3.6.1', body: '' },
+    })
+    expect(result.safetyLevel).toBe('safe')
+    expect(result.running).toBeNull()
+    expect(result.pinned).not.toBeNull()
+  })
+
+  it('returns error when running version is missing and no pinned', () => {
+    const result = analyzeUpdate({
+      runningVersion: null,
+      dockerComposeContent: null,
+      latestRelease: { tag: 'v3.6.0', body: '' },
+    })
+    expect(result.safetyLevel).toBe('error')
+  })
+
+  it('returns error when latest release is missing', () => {
+    const result = analyzeUpdate({
+      runningVersion: '3.6.0',
+      dockerComposeContent: 'image: traefik:v3.6',
+      latestRelease: null,
+    })
+    expect(result.safetyLevel).toBe('error')
+  })
+
+  it('returns error when all inputs are missing', () => {
+    const result = analyzeUpdate({
+      runningVersion: null,
+      dockerComposeContent: null,
+      latestRelease: null,
+    })
+    expect(result.safetyLevel).toBe('error')
+  })
+})
+
+describe('buildDomainRule', () => {
+  it('builds rule for simple host with multiple aliases', () => {
+    const result = buildDomainRule('baby.localhost', ['local.domlee.dev', 'other.domlee.dev'])
+    expect(result).toBe("Host(`baby.local.domlee.dev`) || Host(`baby.other.domlee.dev`)")
+  })
+
+  it('builds rule for subdomain host', () => {
+    const result = buildDomainRule('api.baby.localhost', ['local.domlee.dev', 'other.domlee.dev'])
+    expect(result).toBe("Host(`api.baby.local.domlee.dev`) || Host(`api.baby.other.domlee.dev`)")
+  })
+
+  it('builds rule with single alias', () => {
+    const result = buildDomainRule('baby.localhost', ['local.domlee.dev'])
+    expect(result).toBe("Host(`baby.local.domlee.dev`)")
+  })
+})
+
+describe('addDomainRoute', () => {
+  const existingYaml = `http:
+  routers:
+    baby-web-alt:
+      rule: "Host(\`baby.local.domlee.dev\`) || Host(\`baby.other.domlee.dev\`)"
+      service: baby-web@docker
+      entryPoints:
+        - web
+`
+  const aliases = ['local.domlee.dev', 'other.domlee.dev']
+
+  it('adds a new route', () => {
+    const result = addDomainRoute(existingYaml, 'career-web-alt', 'career.localhost', 'career-web', aliases, parse, stringify)
+    expect(result.success).toBe(true)
+    expect(result.newContent).toContain('career-web-alt')
+    expect(result.newContent).toContain('career-web@docker')
+  })
+
+  it('rejects duplicate router name', () => {
+    const result = addDomainRoute(existingYaml, 'baby-web-alt', 'baby.localhost', 'baby-web', aliases, parse, stringify)
+    expect(result.success).toBe(false)
+    expect(result.error).toContain('already exists')
+  })
+
+  it('creates structure from empty YAML', () => {
+    const result = addDomainRoute('', 'new-route', 'app.localhost', 'app', aliases, parse, stringify)
+    expect(result.success).toBe(true)
+    expect(result.newContent).toContain('new-route')
+    expect(result.newContent).toContain('app@docker')
+  })
+})
+
+describe('removeDomainRoute', () => {
+  const existingYaml = `http:
+  routers:
+    baby-web-alt:
+      rule: "Host(\`baby.local.domlee.dev\`)"
+      service: baby-web@docker
+      entryPoints:
+        - web
+    career-web-alt:
+      rule: "Host(\`career.local.domlee.dev\`)"
+      service: career-web@docker
+      entryPoints:
+        - web
+`
+
+  it('removes an existing route', () => {
+    const result = removeDomainRoute(existingYaml, 'baby-web-alt', parse, stringify)
+    expect(result.success).toBe(true)
+    expect(result.newContent).not.toContain('baby-web-alt')
+    expect(result.newContent).toContain('career-web-alt')
+  })
+
+  it('errors on missing route', () => {
+    const result = removeDomainRoute(existingYaml, 'nonexistent', parse, stringify)
+    expect(result.success).toBe(false)
+    expect(result.error).toContain('not found')
+  })
+})
+
+describe('listDomainRoutes', () => {
+  it('lists all routes', () => {
+    const yaml = `http:
+  routers:
+    baby-web-alt:
+      rule: "Host(\`baby.local.domlee.dev\`)"
+      service: baby-web@docker
+    career-web-alt:
+      rule: "Host(\`career.local.domlee.dev\`)"
+      service: career-web@docker
+`
+    const result = listDomainRoutes(yaml, parse)
+    expect(result).toHaveLength(2)
+    expect(result[0].name).toBe('baby-web-alt')
+    expect(result[0].service).toBe('baby-web@docker')
+    expect(result[1].name).toBe('career-web-alt')
+  })
+
+  it('handles empty file', () => {
+    const result = listDomainRoutes('', parse)
+    expect(result).toEqual([])
+  })
+
+  it('handles file with no routers', () => {
+    const result = listDomainRoutes('http:\n  middlewares: {}', parse)
+    expect(result).toEqual([])
+  })
+})
+
+describe('formatUpdateReport', () => {
+  const baseAnalysis = {
+    running: { major: 3, minor: 6, patch: 0, raw: '3.6.0' },
+    pinned: { major: 3, minor: 6, patch: 0, raw: 'v3.6' },
+    latest: { major: 3, minor: 6, patch: 1, raw: 'v3.6.1' },
+    updateType: 'patch' as const,
+    safetyLevel: 'safe' as const,
+    releaseNotes: 'Bug fixes and improvements.',
+  }
+
+  it('includes version table', () => {
+    const report = formatUpdateReport(baseAnalysis)
+    expect(report).toContain('| Running | 3.6.0 |')
+    expect(report).toContain('| Pinned (docker-compose) | v3.6 |')
+    expect(report).toContain('| Latest (GitHub) | v3.6.1 |')
+  })
+
+  it('shows update instructions when update available', () => {
+    const report = formatUpdateReport(baseAnalysis)
+    expect(report).toContain('## Update Instructions')
+    expect(report).toContain('docker compose pull && docker compose up -d')
+  })
+
+  it('hides update instructions when up-to-date', () => {
+    const report = formatUpdateReport({
+      ...baseAnalysis,
+      latest: { major: 3, minor: 6, patch: 0, raw: 'v3.6.0' },
+      updateType: 'none',
+      safetyLevel: 'up-to-date',
+    })
+    expect(report).not.toContain('## Update Instructions')
+  })
+
+  it('shows pinned vs running mismatch warning', () => {
+    const report = formatUpdateReport({
+      ...baseAnalysis,
+      running: { major: 3, minor: 6, patch: 1, raw: '3.6.1' },
+      pinned: { major: 3, minor: 6, patch: 0, raw: 'v3.6.0' },
+    })
+    expect(report).toContain('differs from pinned version')
+  })
+
+  it('includes release notes', () => {
+    const report = formatUpdateReport(baseAnalysis)
+    expect(report).toContain('## Latest Release Notes')
+    expect(report).toContain('Bug fixes and improvements.')
+  })
+
+  it('truncates long release notes', () => {
+    const longNotes = 'A'.repeat(2000)
+    const report = formatUpdateReport({
+      ...baseAnalysis,
+      releaseNotes: longNotes,
+    })
+    expect(report).toContain('...')
+    expect(report.length).toBeLessThan(longNotes.length + 500)
+  })
+
+  it('includes GitHub releases link', () => {
+    const report = formatUpdateReport(baseAnalysis)
+    expect(report).toContain('https://github.com/traefik/traefik/releases')
   })
 })

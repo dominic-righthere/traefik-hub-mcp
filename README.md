@@ -25,6 +25,7 @@ npm install -g traefik-hub-mcp
 | `TRAEFIK_CONFIG_DIR` | Yes | -- | Path to Traefik config directory (contains `traefik.yml` and `dynamic/`) |
 | `TRAEFIK_HUB_DIR` | Yes | -- | Path to the Traefik Hub repo root (contains `docker-compose.yml`) |
 | `TRAEFIK_API_URL` | No | `http://localhost:8080` | Traefik API base URL |
+| `TRAEFIK_DOMAIN_ALIASES` | No | -- | Comma-separated domain suffixes for multi-domain routing (e.g., `local.domlee.dev`) |
 
 ## Configuration
 
@@ -155,6 +156,7 @@ Add to Cline MCP settings:
 | `list_containers` | List containers on the `traefik-public` network |
 | `container_logs` | Get logs from a container |
 | `restart_container` | Restart a container |
+| `rebuild_service` | Rebuild and recreate a Docker Compose service (`docker compose up -d --build`) |
 
 ### Health & Diagnostics
 
@@ -162,6 +164,7 @@ Add to Cline MCP settings:
 |------|-------------|
 | `check_health` | Check if a domain is responding |
 | `doctor` | Comprehensive stack health check (Docker, network, container, API, ports, config) |
+| `check_update` | Check for newer Traefik versions and whether it's safe to update |
 | `check_setup` | Verify MCP env vars and paths are correctly set |
 
 ### Stack Management
@@ -182,6 +185,14 @@ Add to Cline MCP settings:
 | `list_middleware_types` | Show available middleware types with example configs |
 | `get_cors` | Show current CORS configuration |
 | `update_cors` | Add or remove origins from the `cors-dev` middleware |
+
+### Multi-Domain Routing
+
+| Tool | Description |
+|------|-------------|
+| `add_domain_route` | Add multi-domain route for a service (LAN/Tailscale access) |
+| `remove_domain_route` | Remove a multi-domain route |
+| `list_domain_routes` | List all multi-domain routes |
 
 ## Development
 

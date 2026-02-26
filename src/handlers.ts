@@ -385,6 +385,306 @@ export function checkDatabasePorts(containers: ContainerPortInfo[]): {
   return { exposedDatabases, allSafe: exposedDatabases.length === 0 }
 }
 
+/**
+ * Known Traefik log error patterns and their meanings
+ */
+export const TRAEFIK_LOG_ERROR_PATTERNS: Array<{
+  pattern: RegExp
+  message: string
+  severity: 'fail' | 'warn'
+}> = [
+  {
+    pattern: /Error response from daemon:\s*"/,
+    message: 'Docker socket proxy returning empty errors (broken in-VM proxy)',
+    severity: 'fail',
+  },
+  {
+    pattern: /connection refused/i,
+    message: 'Connection refused to backend service',
+    severity: 'warn',
+  },
+  {
+    pattern: /permission denied.*docker\.sock/i,
+    message: 'Docker socket permission denied',
+    severity: 'fail',
+  },
+  {
+    pattern: /no such host/i,
+    message: 'DNS resolution failure',
+    severity: 'warn',
+  },
+]
+
+/**
+ * Analyze Traefik log text for known error patterns
+ */
+export interface LogAnalysisResult {
+  status: 'ok' | 'warn' | 'fail'
+  matches: Array<{ message: string; severity: 'fail' | 'warn'; count: number }>
+}
+
+export function analyzeTraefikLogs(logText: string): LogAnalysisResult {
+  const matches: LogAnalysisResult['matches'] = []
+
+  for (const { pattern, message, severity } of TRAEFIK_LOG_ERROR_PATTERNS) {
+    const lines = logText.split('\n')
+    const count = lines.filter(line => pattern.test(line)).length
+    if (count > 0) {
+      matches.push({ message, severity, count })
+    }
+  }
+
+  if (matches.length === 0) {
+    return { status: 'ok', matches: [] }
+  }
+
+  const hasFail = matches.some(m => m.severity === 'fail')
+  return { status: hasFail ? 'fail' : 'warn', matches }
+}
+
+// --- Update Check Types & Functions ---
+
+export interface SemVer {
+  major: number
+  minor: number
+  patch: number
+  raw: string
+}
+
+export type UpdateType = 'major' | 'minor' | 'patch' | 'none' | 'downgrade'
+
+export interface UpdateCheckInput {
+  runningVersion: string | null
+  dockerComposeContent: string | null
+  latestRelease: { tag: string; body: string } | null
+}
+
+export interface UpdateAnalysis {
+  running: SemVer | null
+  pinned: SemVer | null
+  latest: SemVer | null
+  updateType: UpdateType | null
+  safetyLevel: 'up-to-date' | 'safe' | 'generally-safe' | 'review-required' | 'error'
+  releaseNotes: string | null
+}
+
+export function parseSemver(input: string): SemVer | null {
+  const match = input.match(/v?(\d+)\.(\d+)(?:\.(\d+))?/)
+  if (!match) return null
+  return {
+    major: parseInt(match[1], 10),
+    minor: parseInt(match[2], 10),
+    patch: parseInt(match[3] ?? '0', 10),
+    raw: input,
+  }
+}
+
+export function parsePinnedVersion(dockerComposeContent: string): SemVer | null {
+  const match = dockerComposeContent.match(/image:\s*traefik:(\S+)/)
+  if (!match) return null
+  const tag = match[1]
+  if (tag === 'latest') return null
+  return parseSemver(tag)
+}
+
+export function compareVersions(from: SemVer, to: SemVer): UpdateType {
+  if (to.major > from.major) return 'major'
+  if (to.major < from.major) return 'downgrade'
+  if (to.minor > from.minor) return 'minor'
+  if (to.minor < from.minor) return 'downgrade'
+  if (to.patch > from.patch) return 'patch'
+  if (to.patch < from.patch) return 'downgrade'
+  return 'none'
+}
+
+export function analyzeUpdate(input: UpdateCheckInput): UpdateAnalysis {
+  const running = input.runningVersion ? parseSemver(input.runningVersion) : null
+  const pinned = input.dockerComposeContent ? parsePinnedVersion(input.dockerComposeContent) : null
+  const latest = input.latestRelease ? parseSemver(input.latestRelease.tag) : null
+  const releaseNotes = input.latestRelease?.body ?? null
+
+  const source = running || pinned
+  if (!source || !latest) {
+    return { running, pinned, latest, updateType: null, safetyLevel: 'error', releaseNotes }
+  }
+
+  const updateType = compareVersions(source, latest)
+
+  let safetyLevel: UpdateAnalysis['safetyLevel']
+  switch (updateType) {
+    case 'none':
+    case 'downgrade':
+      safetyLevel = 'up-to-date'
+      break
+    case 'patch':
+      safetyLevel = 'safe'
+      break
+    case 'minor':
+      safetyLevel = 'generally-safe'
+      break
+    case 'major':
+      safetyLevel = 'review-required'
+      break
+  }
+
+  return { running, pinned, latest, updateType, safetyLevel, releaseNotes }
+}
+
+export function formatUpdateReport(analysis: UpdateAnalysis): string {
+  const lines: string[] = ['# Traefik Update Check\n']
+
+  // Version table
+  lines.push('| Source | Version |')
+  lines.push('|--------|---------|')
+  lines.push(`| Running | ${analysis.running?.raw ?? 'unknown'} |`)
+  lines.push(`| Pinned (docker-compose) | ${analysis.pinned?.raw ?? 'unknown'} |`)
+  lines.push(`| Latest (GitHub) | ${analysis.latest?.raw ?? 'unknown'} |`)
+  lines.push('')
+
+  // Safety badge
+  const badges: Record<UpdateAnalysis['safetyLevel'], string> = {
+    'up-to-date': '✓ **Up to date** — no action needed',
+    'safe': '✓ **Safe to update** — patch release (bug fixes only)',
+    'generally-safe': '⚠ **Generally safe** — minor release (new features, backwards compatible)',
+    'review-required': '⚠ **Review required** — major release (may contain breaking changes)',
+    'error': '✗ **Could not determine** — version information unavailable',
+  }
+  lines.push(badges[analysis.safetyLevel])
+  lines.push('')
+
+  // Pinned vs running mismatch warning
+  if (analysis.running && analysis.pinned) {
+    const pinnedVsRunning = compareVersions(analysis.pinned, analysis.running)
+    if (pinnedVsRunning !== 'none') {
+      lines.push(`> **Note:** Running version (${analysis.running.raw}) differs from pinned version (${analysis.pinned.raw}). Consider aligning them.`)
+      lines.push('')
+    }
+  }
+
+  // Update instructions
+  if (analysis.safetyLevel !== 'up-to-date' && analysis.safetyLevel !== 'error' && analysis.latest) {
+    lines.push('## Update Instructions')
+    lines.push('')
+    lines.push('```bash')
+    lines.push(`# Update docker-compose.yml image tag to traefik:v${analysis.latest.major}.${analysis.latest.minor}.${analysis.latest.patch}`)
+    lines.push('# Then restart:')
+    lines.push('docker compose pull && docker compose up -d')
+    lines.push('```')
+    lines.push('')
+  }
+
+  // Release notes
+  if (analysis.releaseNotes) {
+    lines.push('## Latest Release Notes')
+    lines.push('')
+    const maxLen = 1500
+    if (analysis.releaseNotes.length > maxLen) {
+      lines.push(analysis.releaseNotes.slice(0, maxLen) + '...')
+    } else {
+      lines.push(analysis.releaseNotes)
+    }
+    lines.push('')
+  }
+
+  lines.push('[View all releases on GitHub](https://github.com/traefik/traefik/releases)')
+
+  return lines.join('\n')
+}
+
+/**
+ * Build a Traefik Host rule for domain aliases.
+ * Takes a localhost hostname (e.g. "baby.localhost" or "api.baby.localhost")
+ * and returns a rule matching the same subdomain on each alias domain.
+ */
+export function buildDomainRule(localhostHost: string, domainAliases: string[]): string {
+  const subdomain = localhostHost.replace(/\.localhost$/, '')
+  const hosts = domainAliases.map(alias => `Host(\`${subdomain}.${alias}\`)`)
+  return hosts.join(' || ')
+}
+
+/**
+ * Add a domain route to multi-domain.yml content
+ */
+export function addDomainRoute(
+  yamlContent: string,
+  routerName: string,
+  localhostHost: string,
+  serviceName: string,
+  domainAliases: string[],
+  yamlParse: (content: string) => unknown,
+  yamlStringify: (data: unknown) => string
+): { success: boolean; newContent?: string; error?: string } {
+  let data: { http?: { routers?: Record<string, unknown> } }
+  try {
+    data = (yamlParse(yamlContent) as typeof data) || {}
+  } catch {
+    data = {}
+  }
+
+  if (!data.http) data.http = {}
+  if (!data.http.routers) data.http.routers = {}
+
+  if (data.http.routers[routerName]) {
+    return { success: false, error: `Router '${routerName}' already exists` }
+  }
+
+  const rule = buildDomainRule(localhostHost, domainAliases)
+  data.http.routers[routerName] = {
+    rule,
+    service: `${serviceName}@docker`,
+    entryPoints: ['web'],
+  }
+
+  return { success: true, newContent: yamlStringify(data) }
+}
+
+/**
+ * Remove a domain route from multi-domain.yml content
+ */
+export function removeDomainRoute(
+  yamlContent: string,
+  routerName: string,
+  yamlParse: (content: string) => unknown,
+  yamlStringify: (data: unknown) => string
+): { success: boolean; newContent?: string; error?: string } {
+  let data: { http?: { routers?: Record<string, unknown> } }
+  try {
+    data = (yamlParse(yamlContent) as typeof data) || {}
+  } catch {
+    return { success: false, error: 'Could not parse multi-domain.yml' }
+  }
+
+  if (!data.http?.routers?.[routerName]) {
+    return { success: false, error: `Router '${routerName}' not found` }
+  }
+
+  delete data.http.routers[routerName]
+
+  return { success: true, newContent: yamlStringify(data) }
+}
+
+/**
+ * List all domain routes from multi-domain.yml content
+ */
+export function listDomainRoutes(
+  yamlContent: string,
+  yamlParse: (content: string) => unknown
+): Array<{ name: string; rule: string; service: string }> {
+  let data: { http?: { routers?: Record<string, { rule?: string; service?: string }> } }
+  try {
+    data = (yamlParse(yamlContent) as typeof data) || {}
+  } catch {
+    return []
+  }
+
+  const routers = data.http?.routers || {}
+  return Object.entries(routers).map(([name, config]) => ({
+    name,
+    rule: config.rule || '',
+    service: config.service || '',
+  }))
+}
+
 export function updateCorsOrigins(
   currentOrigins: string[],
   add?: string[],

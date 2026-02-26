@@ -18,7 +18,15 @@ import {
   addMiddlewareToConfig,
   updateCorsOrigins,
   checkDatabasePorts,
+  analyzeTraefikLogs,
+  analyzeUpdate,
+  formatUpdateReport,
+  buildDomainRule,
+  addDomainRoute,
+  removeDomainRoute,
+  listDomainRoutes,
   type ContainerPortInfo,
+  type UpdateCheckInput,
 } from "./handlers.js";
 
 const execAsync = promisify(exec);
@@ -36,6 +44,7 @@ function requireEnv(name: string): string {
 
 const TRAEFIK_CONFIG_DIR = requireEnv("TRAEFIK_CONFIG_DIR");
 const TRAEFIK_HUB_DIR = requireEnv("TRAEFIK_HUB_DIR");
+const DOMAIN_ALIASES = (process.env.TRAEFIK_DOMAIN_ALIASES || "").split(",").filter(Boolean);
 const docker = new Docker();
 
 const server = new Server(
@@ -142,6 +151,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "rebuild_service",
+      description: "Rebuild and recreate a Docker Compose service (runs `docker compose up -d --build <service>`)",
+      inputSchema: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Container name" },
+        },
+        required: ["name"],
+      },
+    },
+    {
       name: "check_health",
       description: "Check if a domain is responding",
       inputSchema: {
@@ -234,6 +254,40 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
       },
     },
+    {
+      name: "check_update",
+      description: "Check if a newer Traefik version is available and whether it's safe to update",
+      inputSchema: { type: "object", properties: {}, required: [] },
+    },
+    {
+      name: "add_domain_route",
+      description: "Add multi-domain route for a service (makes it accessible via LAN/Tailscale)",
+      inputSchema: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Router name (e.g., baby-web-alt)" },
+          domain: { type: "string", description: "Localhost hostname (e.g., baby.localhost)" },
+          service: { type: "string", description: "Docker service name (e.g., baby-web)" },
+        },
+        required: ["name", "domain", "service"],
+      },
+    },
+    {
+      name: "remove_domain_route",
+      description: "Remove a multi-domain route",
+      inputSchema: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Router name to remove" },
+        },
+        required: ["name"],
+      },
+    },
+    {
+      name: "list_domain_routes",
+      description: "List all multi-domain routes (LAN/Tailscale access)",
+      inputSchema: { type: "object", properties: {}, required: [] },
+    },
   ],
 }));
 
@@ -259,6 +313,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return await handleContainerLogs(args.name as string, (args.tail as number) || 50);
       case "restart_container":
         return await handleRestartContainer(args.name as string);
+      case "rebuild_service":
+        return await handleRebuildService(args.name as string);
       case "check_health":
         return await handleCheckHealth(args.domain as string);
       case "doctor":
@@ -295,6 +351,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           args.add as string[] | undefined,
           args.remove as string[] | undefined
         );
+      case "check_update":
+        return await handleCheckUpdate();
+      case "add_domain_route":
+        return await handleAddDomainRoute(
+          args.name as string,
+          args.domain as string,
+          args.service as string
+        );
+      case "remove_domain_route":
+        return await handleRemoveDomainRoute(args.name as string);
+      case "list_domain_routes":
+        return await handleListDomainRoutes();
       default:
         return { content: [{ type: "text", text: `Unknown tool: ${name}` }] };
     }
@@ -461,6 +529,41 @@ async function handleRestartContainer(name: string) {
   }
 }
 
+async function handleRebuildService(name: string) {
+  try {
+    const container = docker.getContainer(name);
+    const info = await container.inspect();
+    const labels = info.Config?.Labels || {};
+
+    const projectDir = labels["com.docker.compose.project.working_dir"];
+    const service = labels["com.docker.compose.service"];
+
+    if (!projectDir || !service) {
+      return {
+        content: [{ type: "text", text: `Container '${name}' is not a Docker Compose service (missing compose labels).` }],
+      };
+    }
+
+    const { stdout, stderr } = await execAsync(
+      `docker compose up -d --build ${service}`,
+      { cwd: projectDir }
+    );
+
+    return {
+      content: [{
+        type: "text",
+        text: `# Service Rebuilt\n\n**Container**: ${name}\n**Service**: ${service}\n**Project**: ${projectDir}\n\n${stdout || "Rebuilt successfully."}${stderr ? `\n\nWarnings:\n${stderr}` : ""}`,
+      }],
+    };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes("no such container") || msg.includes("404")) {
+      return { content: [{ type: "text", text: `Container '${name}' not found.` }] };
+    }
+    return { content: [{ type: "text", text: `Failed to rebuild: ${msg}` }] };
+  }
+}
+
 async function handleCheckHealth(domain: string) {
   try {
     const res = await fetch(`http://${domain}`, { signal: AbortSignal.timeout(5000) });
@@ -522,7 +625,78 @@ async function handleDoctor() {
     checks.push({ name: "Traefik container", status: "fail", tip: "Could not list containers" });
   }
 
-  // 4. Traefik API responding
+  // 4. Docker socket accessible from inside Traefik container
+  try {
+    const traefikContainer = docker.getContainer("traefik");
+    const socketCheck = await traefikContainer.exec({
+      Cmd: ["test", "-S", "/var/run/docker.sock"],
+      AttachStdout: true,
+      AttachStderr: true,
+    });
+    const socketStream = await socketCheck.start({});
+    await new Promise<void>((resolve) => {
+      socketStream.on("end", () => resolve());
+      socketStream.on("error", () => resolve());
+      setTimeout(() => resolve(), 3000);
+    });
+    const inspectResult = await socketCheck.inspect();
+    if (inspectResult.ExitCode === 0) {
+      checks.push({ name: "Docker socket (in-container)", status: "ok", detail: "Socket file mounted" });
+    } else {
+      checks.push({
+        name: "Docker socket (in-container)",
+        status: "fail",
+        detail: "Docker socket not found inside container",
+        tip: "Check docker-compose.yml volume mount: /var/run/docker.sock:/var/run/docker.sock:ro",
+      });
+    }
+  } catch {
+    checks.push({
+      name: "Docker socket (in-container)",
+      status: "warn",
+      detail: "Could not exec into Traefik container",
+      tip: "Traefik container may not be running",
+    });
+  }
+
+  // 5. Docker provider health — labeled containers vs discovered routers
+  try {
+    const labeledContainers = await docker.listContainers({
+      filters: { label: ["traefik.enable=true"], network: ["traefik-public"] },
+    });
+    const labeledCount = labeledContainers.length;
+
+    let dockerRouterCount = 0;
+    try {
+      const routers = (await traefikApi("http/routers")) as Array<{ provider?: string }>;
+      dockerRouterCount = routers.filter((r) => r.provider === "docker").length;
+    } catch {
+      // API may not be up yet — skip
+    }
+
+    if (labeledCount > 0 && dockerRouterCount === 0) {
+      checks.push({
+        name: "Docker provider",
+        status: "fail",
+        detail: `${labeledCount} labeled containers but 0 Docker routers`,
+        tip: "Traefik's Docker provider cannot discover containers. Check Docker socket access (see above) or restart Docker Desktop.",
+      });
+    } else {
+      checks.push({
+        name: "Docker provider",
+        status: "ok",
+        detail: `${dockerRouterCount} Docker routers from ${labeledCount} labeled containers`,
+      });
+    }
+  } catch {
+    checks.push({
+      name: "Docker provider",
+      status: "warn",
+      detail: "Could not check Docker provider health",
+    });
+  }
+
+  // 6. Traefik API responding
   try {
     const res = await fetch(`${TRAEFIK_API_URL}/api/overview`, { signal: AbortSignal.timeout(3000) });
     if (res.ok) {
@@ -538,7 +712,7 @@ async function handleDoctor() {
     });
   }
 
-  // 5. Port 80 check (via Traefik entrypoint)
+  // 7. Port 80 check (via Traefik entrypoint)
   try {
     const res = await fetch("http://localhost:80", { signal: AbortSignal.timeout(3000) });
     // Any response means port 80 is handled by Traefik
@@ -552,7 +726,7 @@ async function handleDoctor() {
     }
   }
 
-  // 6. Dashboard accessible
+  // 8. Dashboard accessible
   try {
     const res = await fetch("http://traefik.localhost", { signal: AbortSignal.timeout(3000) });
     if (res.ok || res.status === 200) {
@@ -568,7 +742,7 @@ async function handleDoctor() {
     });
   }
 
-  // 7. Config files exist
+  // 9. Config files exist
   try {
     await readFile(`${TRAEFIK_CONFIG_DIR}/traefik.yml`, "utf-8");
     await readFile(`${TRAEFIK_CONFIG_DIR}/dynamic/middlewares.yml`, "utf-8");
@@ -581,7 +755,7 @@ async function handleDoctor() {
     });
   }
 
-  // 8. Active routers/services count
+  // 10. Active routers/services count
   try {
     const overview = (await traefikApi("overview")) as {
       http?: { routers?: { total?: number }; services?: { total?: number } };
@@ -597,7 +771,35 @@ async function handleDoctor() {
     checks.push({ name: "Active routes", status: "fail", tip: "Could not fetch from Traefik API" });
   }
 
-  // 9. Check for database containers with exposed ports
+  // 11. Traefik log analysis
+  try {
+    const traefikContainer = docker.getContainer("traefik");
+    const logs = await traefikContainer.logs({ stdout: true, stderr: true, tail: 30 });
+    const logText = logs.toString();
+    const logResult = analyzeTraefikLogs(logText);
+
+    if (logResult.status === "ok") {
+      checks.push({ name: "Traefik logs", status: "ok", detail: "No error patterns in recent logs" });
+    } else {
+      const details = logResult.matches.map((m) => `${m.message} (${m.count}x)`).join("; ");
+      checks.push({
+        name: "Traefik logs",
+        status: logResult.status,
+        detail: details,
+        tip: logResult.status === "fail"
+          ? "Critical errors in Traefik logs. Run container_logs for full details."
+          : "Warnings in Traefik logs. Run container_logs for full details.",
+      });
+    }
+  } catch {
+    checks.push({
+      name: "Traefik logs",
+      status: "warn",
+      detail: "Could not read Traefik container logs",
+    });
+  }
+
+  // 12. Check for database containers with exposed ports
   try {
     const allContainers = await docker.listContainers({ all: false });
     const containerInfo: ContainerPortInfo[] = allContainers.map(c => ({
@@ -662,7 +864,14 @@ async function handleGenerateLabels(
   port: number,
   middlewares?: string[]
 ) {
-  const output = generateLabels(name, domain, port, middlewares);
+  let output = generateLabels(name, domain, port, middlewares);
+
+  if (DOMAIN_ALIASES.length) {
+    const subdomain = domain.replace(/\.localhost$/, '');
+    const altDomains = DOMAIN_ALIASES.map(alias => `- ${subdomain}.${alias}`).join('\n');
+    output += `\n\n## Multi-Domain Access\nRun \`add_domain_route\` to make this service accessible on LAN/Tailscale:\n${altDomains}`;
+  }
+
   return { content: [{ type: "text", text: output }] };
 }
 
@@ -919,6 +1128,145 @@ async function handleUpdateCors(add?: string[], remove?: string[]) {
   text += "\n\nTraefik will hot-reload automatically.";
 
   return { content: [{ type: "text", text }] };
+}
+
+async function handleCheckUpdate() {
+  const input: UpdateCheckInput = {
+    runningVersion: null,
+    dockerComposeContent: null,
+    latestRelease: null,
+  };
+
+  // 1. Running version from Traefik API
+  try {
+    const version = (await traefikApi("version")) as { Version?: string };
+    input.runningVersion = version.Version ?? null;
+  } catch {
+    // Traefik may not be running
+  }
+
+  // 2. Pinned version from docker-compose.yml
+  try {
+    input.dockerComposeContent = await readFile(
+      `${TRAEFIK_HUB_DIR}/docker-compose.yml`,
+      "utf-8"
+    );
+  } catch {
+    // File may not exist
+  }
+
+  // 3. Latest release from GitHub
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+    const res = await fetch(
+      "https://api.github.com/repos/traefik/traefik/releases/latest",
+      {
+        headers: { "User-Agent": "traefik-hub-mcp" },
+        signal: controller.signal,
+      }
+    );
+    clearTimeout(timeout);
+    if (res.ok) {
+      const data = (await res.json()) as { tag_name?: string; body?: string };
+      if (data.tag_name) {
+        input.latestRelease = {
+          tag: data.tag_name,
+          body: data.body ?? "",
+        };
+      }
+    }
+  } catch {
+    // GitHub may be unreachable
+  }
+
+  const analysis = analyzeUpdate(input);
+  const report = formatUpdateReport(analysis);
+  return { content: [{ type: "text", text: report }] };
+}
+
+async function handleAddDomainRoute(name: string, domain: string, service: string) {
+  if (!DOMAIN_ALIASES.length) {
+    return {
+      content: [{ type: "text", text: "Error: TRAEFIK_DOMAIN_ALIASES env var not configured. Set it to a comma-separated list of domain suffixes (e.g., mbp.local,mbp.taila2f13a.ts.net)." }],
+    };
+  }
+
+  const multiDomainPath = `${TRAEFIK_CONFIG_DIR}/dynamic/multi-domain.yml`;
+
+  let content: string;
+  try {
+    content = await readFile(multiDomainPath, "utf-8");
+  } catch {
+    content = "";
+  }
+
+  const result = addDomainRoute(content, name, domain, service, DOMAIN_ALIASES, parse, stringify);
+
+  if (!result.success) {
+    return { content: [{ type: "text", text: `Error: ${result.error}` }] };
+  }
+
+  await writeFile(multiDomainPath, result.newContent!);
+
+  const rule = buildDomainRule(domain, DOMAIN_ALIASES);
+  return {
+    content: [{
+      type: "text",
+      text: `# Domain Route Added\n\n**Router**: ${name}\n**Rule**: \`${rule}\`\n**Service**: ${service}@docker\n\nTraefik will hot-reload this automatically.`,
+    }],
+  };
+}
+
+async function handleRemoveDomainRoute(name: string) {
+  const multiDomainPath = `${TRAEFIK_CONFIG_DIR}/dynamic/multi-domain.yml`;
+
+  let content: string;
+  try {
+    content = await readFile(multiDomainPath, "utf-8");
+  } catch {
+    return { content: [{ type: "text", text: "Error: multi-domain.yml not found" }] };
+  }
+
+  const result = removeDomainRoute(content, name, parse, stringify);
+
+  if (!result.success) {
+    return { content: [{ type: "text", text: `Error: ${result.error}` }] };
+  }
+
+  await writeFile(multiDomainPath, result.newContent!);
+
+  return {
+    content: [{ type: "text", text: `# Domain Route Removed\n\nRemoved router \`${name}\` from multi-domain.yml.\n\nTraefik will hot-reload this automatically.` }],
+  };
+}
+
+async function handleListDomainRoutes() {
+  const multiDomainPath = `${TRAEFIK_CONFIG_DIR}/dynamic/multi-domain.yml`;
+
+  let content: string;
+  try {
+    content = await readFile(multiDomainPath, "utf-8");
+  } catch {
+    return { content: [{ type: "text", text: "No multi-domain.yml found. No domain routes configured." }] };
+  }
+
+  const routes = listDomainRoutes(content, parse);
+
+  if (!routes.length) {
+    return { content: [{ type: "text", text: "No domain routes configured." }] };
+  }
+
+  const lines = [
+    "# Multi-Domain Routes\n",
+    "| Router | Rule | Service |",
+    "|--------|------|---------|",
+  ];
+  for (const r of routes) {
+    lines.push(`| ${r.name} | \`${r.rule}\` | ${r.service} |`);
+  }
+
+  return { content: [{ type: "text", text: lines.join("\n") }] };
 }
 
 // Start server
